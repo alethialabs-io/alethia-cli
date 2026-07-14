@@ -1,0 +1,85 @@
+{
+  "format_version": "1.2",
+  "terraform_version": "1.9.0",
+  "_comment": "A REALISTIC Alethia Hetzner/Talos provision plan: hcloud_ (VMs, now behind an hcloud POSTURE control set) + talos_ (k8s bootstrap) + imager_ (image factory) + minio_ (in-cluster S3) + helm_ (CNI/CSI) + random_. The talos/imager/minio/helm/random layers carry no cloud-authority surface, so SCOPE-001 must NOT flip this to not_evaluable; the hcloud_server is firewalled (firewall_ids set) so HCLOUD-FW-001 passes and there is no hcloud_firewall to expose anything -> HCLOUD-NET-001 is a vacuous pass. Overall PASS.",
+  "resource_changes": [
+    {
+      "address": "hcloud_server.node",
+      "mode": "managed",
+      "type": "hcloud_server",
+      "name": "node",
+      "provider_name": "registry.terraform.io/hetznercloud/hcloud",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": { "server_type": "cpx21", "location": "nbg1", "firewall_ids": [123] },
+        "after_unknown": {}
+      }
+    },
+    {
+      "address": "imager_image.talos",
+      "mode": "managed",
+      "type": "imager_image",
+      "name": "talos",
+      "provider_name": "registry.terraform.io/siderolabs/imager",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": { "version": "v1.9.0" },
+        "after_unknown": {}
+      }
+    },
+    {
+      "address": "talos_machine_configuration_apply.cp",
+      "mode": "managed",
+      "type": "talos_machine_configuration_apply",
+      "name": "cp",
+      "provider_name": "registry.terraform.io/siderolabs/talos",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": {},
+        "after_unknown": {}
+      }
+    },
+    {
+      "address": "helm_release.cilium",
+      "mode": "managed",
+      "type": "helm_release",
+      "name": "cilium",
+      "provider_name": "registry.terraform.io/hashicorp/helm",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": { "chart": "cilium", "namespace": "kube-system" },
+        "after_unknown": {}
+      }
+    },
+    {
+      "address": "minio_iam_user.app",
+      "mode": "managed",
+      "type": "minio_iam_user",
+      "name": "app",
+      "provider_name": "registry.terraform.io/aminueza/minio",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": { "name": "app" },
+        "after_unknown": {}
+      }
+    },
+    {
+      "address": "random_id.suffix",
+      "mode": "managed",
+      "type": "random_id",
+      "name": "suffix",
+      "provider_name": "registry.terraform.io/hashicorp/random",
+      "change": {
+        "actions": ["create"],
+        "before": null,
+        "after": { "byte_length": 4 },
+        "after_unknown": {}
+      }
+    }
+  ]
+}
