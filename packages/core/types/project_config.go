@@ -4,19 +4,29 @@
 package types
 
 type ProjectConfig struct {
-	ID               string `json:"id"`
-	UserID           string `json:"user_id"`
-	ProjectName      string `json:"project_name"`
-	EnvironmentStage string `json:"environment_stage"`
-	Region           string `json:"region"`
-	IacVersion       string `json:"iac_version"`
-	CloudIdentityID  string `json:"cloud_identity_id"`
-	Provider         string `json:"provider"`
+	ID               string           `json:"id"`
+	UserID           string           `json:"user_id"`
+	ProjectName      string           `json:"project_name"`
+	EnvironmentStage EnvironmentStage `json:"environment_stage"`
+	Region           string           `json:"region"`
+	IacVersion       string           `json:"iac_version"`
+	CloudIdentityID  string           `json:"cloud_identity_id"`
+	Provider         CloudProvider    `json:"provider"`
 
 	// EnvironmentID is the target environment's stable UUID (distinct from the human
 	// EnvironmentStage name). Emitted as the `alethia:environment-id` tag/label so a
 	// guarded sweeper can scope destroys to exactly one environment's cloud resources.
 	EnvironmentID string `json:"environment_id,omitempty"`
+
+	// Placement (decoupled env-model, #836): where this Environment runs on its Fabric.
+	// FabricID = the infra unit (control plane + network + shared add-ons + tofu state) this env
+	// is placed onto; PlacementMode ∈ namespace|vcluster|dedicated; Namespace = the ArgoCD
+	// destination namespace for namespace/vcluster placements (empty → derived from the env name).
+	// The provisioner (#838) keys tofu state per-Fabric and sets the ArgoCD Application
+	// destination from these. Empty PlacementMode is treated as `dedicated` (legacy env=cluster).
+	FabricID      string        `json:"fabric_id,omitempty"`
+	PlacementMode PlacementMode `json:"placement_mode,omitempty"`
+	Namespace     string        `json:"namespace,omitempty"`
 
 	// Classification is the frozen per-dimension classification captured onto the job's
 	// config_snapshot by the console (B1.1): dimension key → sorted value slugs, with the
@@ -118,9 +128,9 @@ func (c *ProjectConfig) ConnectorCredentialFor(category, slug string) map[string
 // several components already carry a pluggable connector slug under json:"provider"
 // (cloudflare/vault/…), which is an orthogonal concern from the cloud account.
 type Placement struct {
-	CloudProvider   string `json:"cloud_provider"`
-	CloudIdentityID string `json:"cloud_identity_id"`
-	Region          string `json:"region"`
+	CloudProvider   CloudProvider `json:"cloud_provider"`
+	CloudIdentityID string        `json:"cloud_identity_id"`
+	Region          string        `json:"region"`
 }
 
 type ProjectNetworkConfig struct {
@@ -206,9 +216,9 @@ type ProjectDatabaseConfig struct {
 
 type ProjectCacheConfig struct {
 	Placement
-	Name          string `json:"name"`
-	Engine        string `json:"engine"`
-	EngineVersion string `json:"engine_version"`
+	Name          string      `json:"name"`
+	Engine        CacheEngine `json:"engine"`
+	EngineVersion string      `json:"engine_version"`
 	// Concrete provider SKU (legacy / explicit). When empty, MemoryGB resolves it.
 	NodeType string `json:"node_type"`
 	// Cloud-indifferent size (preferred); resolved to the nearest provider SKU.
@@ -233,20 +243,20 @@ type ProjectTopicConfig struct {
 }
 
 type TopicSubscription struct {
-	Protocol string `json:"protocol"`
-	Endpoint string `json:"endpoint"`
+	Protocol TopicSubscriptionProtocol `json:"protocol"`
+	Endpoint string                    `json:"endpoint"`
 }
 
 type ProjectNosqlConfig struct {
 	Placement
-	Name                string `json:"name"`
-	PartitionKey        string `json:"partition_key"`
-	PartitionKeyType    string `json:"partition_key_type"`
-	SortKey             string `json:"sort_key"`
-	SortKeyType         string `json:"sort_key_type"`
-	TableType           string `json:"table_type"`
-	CapacityMode        string `json:"capacity_mode"`
-	PointInTimeRecovery bool   `json:"point_in_time_recovery"`
+	Name                string            `json:"name"`
+	PartitionKey        string            `json:"partition_key"`
+	PartitionKeyType    NosqlKeyType      `json:"partition_key_type"`
+	SortKey             string            `json:"sort_key"`
+	SortKeyType         NosqlKeyType      `json:"sort_key_type"`
+	TableType           NosqlTableType    `json:"table_type"`
+	CapacityMode        NosqlCapacityMode `json:"capacity_mode"`
+	PointInTimeRecovery bool              `json:"point_in_time_recovery"`
 }
 
 type ProjectSecretConfig struct {
@@ -283,15 +293,24 @@ type ProjectStorageBucketConfig struct {
 // build/push (from Source when Kind=="repo") is W2, infra-binding is W3.
 type ProjectServiceConfig struct {
 	Placement
-	Name      string               `json:"name"`
-	Type      string               `json:"type"` // deployment | job | cronjob | statefulset
-	Source    ProjectServiceSource `json:"source"`
-	Build     *ProjectServiceBuild `json:"build,omitempty"`
-	Env       []ServiceEnvVar      `json:"env"`
-	Ports     []ServicePort        `json:"ports"`
-	Replicas  int                  `json:"replicas"`
-	Resources *ServiceResources    `json:"resources,omitempty"`
-	Probe     *ServiceProbe        `json:"probe,omitempty"`
+	Name   string               `json:"name"`
+	Type   ServiceWorkloadType  `json:"type"` // deployment | job | cronjob | statefulset
+	Source ProjectServiceSource `json:"source"`
+	Build  *ProjectServiceBuild `json:"build,omitempty"`
+	Env    []ServiceEnvVar      `json:"env"`
+	// Bindings are the W3 edges to backing resources (service→database/cache/queue/secret) and
+	// the env each injects. The runner resolves each to the provisioned resource's endpoint
+	// (tofu output) / credentials (ExternalSecret → k8s Secret) at deploy time.
+	Bindings  []ServiceBinding  `json:"bindings"`
+	Ports     []ServicePort     `json:"ports"`
+	Replicas  int               `json:"replicas"`
+	Resources *ServiceResources `json:"resources,omitempty"`
+	Probe     *ServiceProbe     `json:"probe,omitempty"`
+	// ResolvedImage is the W2 build's write-back slot — the pushed image digest URI
+	// (e.g. "<acct>.dkr.ecr.<region>.amazonaws.com/<repo>@sha256:…") persisted from a BUILD
+	// job's result. Distinct from Source (the user's input); empty until a build has run.
+	// The manifest renderer substitutes it for the workload image (retiring ":latest").
+	ResolvedImage string `json:"resolved_image,omitempty"`
 }
 
 // ProjectServiceSource is the flattened form of the TS discriminated union
@@ -313,6 +332,58 @@ type ProjectServiceBuild struct {
 type ServiceEnvVar struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
+}
+
+// ServiceBinding is a service's declared edge to a backing resource (referenced by {Kind, Name} —
+// the config join key) plus the env its connection facets inject. Non-secret facets
+// (endpoint/port) resolve to templated values from the resource's tofu outputs; credential facets
+// resolve keylessly via an ExternalSecret (ESO ClusterSecretStore) → k8s Secret → secretKeyRef.
+type ServiceBinding struct {
+	Target ServiceBindingTarget      `json:"target"`
+	Inject []ServiceBindingInjection `json:"inject"`
+}
+
+// ServiceBindingTarget references the backing resource by kind + name.
+//
+// A FIRST-CLASS target (an Alethia-provisioned database/cache/queue) has Address == "" and
+// nil OutputKeys: its facets resolve from the platform template's known output keys
+// (manifests.endpointOutputKey). A BYO-IaC target — a resource in a customer-authored tofu
+// module — sets Address (its Terraform address, the universal join key) and OutputKeys,
+// because the module's outputs follow the CUSTOMER's naming, which no platform key map can
+// know (#687). Address != "" is the discriminator.
+type ServiceBindingTarget struct {
+	Kind ServiceBindingKind `json:"kind"`
+	Name string             `json:"name"`
+	// Address is the bound resource's Terraform address (e.g.
+	// "module.db.aws_db_instance.main"). Set only for a BYO-IaC target; "" for first-class.
+	Address string `json:"address,omitempty"`
+	// OutputKeys maps a facet to the customer module's tofu OUTPUT NAME that carries it
+	// (chosen at bind time from IacScanReport.outputs). Set only for a BYO-IaC target; nil for
+	// first-class. An absent/empty key for a facet means "no declared output" — the facet is
+	// resolved fail-closed (reported unsatisfiable, never guessed). See manifests.resolveBindings.
+	OutputKeys *ServiceBindingOutputKeys `json:"output_keys,omitempty"`
+}
+
+// ServiceBindingOutputKeys names the customer module's tofu outputs a BYO-IaC binding
+// resolves its facets against. Every field optional — an absent key makes that facet
+// unsatisfiable (fail-closed), never guessed.
+type ServiceBindingOutputKeys struct {
+	// Endpoint is the output holding the resource's connection endpoint/host.
+	Endpoint string `json:"endpoint,omitempty"`
+	// Port is the output holding the resource's port; when empty the kind's conventional
+	// defaultPort is used (matching the first-class path).
+	Port string `json:"port,omitempty"`
+	// CredentialSecret is the output holding the name/ARN of the cloud secret-store secret
+	// that carries the resource's master credentials — the ExternalSecret RemoteKey. Empty
+	// means no keyless credential path (the module exported no such secret): credential
+	// facets are then unsatisfiable, and no secretKeyRef is emitted.
+	CredentialSecret string `json:"credential_secret,omitempty"`
+}
+
+// ServiceBindingInjection maps one workload env var to one facet of the bound resource.
+type ServiceBindingInjection struct {
+	Env  string              `json:"env"`
+	From ServiceBindingFacet `json:"from"`
 }
 
 // ServicePort is a container port the workload exposes.

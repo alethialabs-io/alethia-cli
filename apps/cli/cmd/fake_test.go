@@ -46,6 +46,24 @@ type fakeClient struct {
 	createdComp  *api.Component
 	classDims    []api.ClassificationDimension
 	classAssigns []api.ClassificationAssignment
+	configExport *api.ConfigurationExport
+	repos        []api.Repository
+	providerStat *api.ProviderStatus
+	verifyResult *api.ConnectIdentityResponse
+	drift        *api.DriftPosture
+	cost         *api.EnvironmentCost
+	protection   []api.ProtectionRule
+	probes       []api.ProbeState
+	addons       *api.ProjectAddons
+	byoCharts    *api.ProjectByoCharts
+	iacSource    *api.IacSource
+	promotions   []api.Promotion
+	promotion    *api.PromotionDetail
+	staged       *api.StagedChanges
+	cloudInv     *api.CloudInventory
+	orgSettings  *api.OrgSettings
+	agents       []api.Agent
+	agent        *api.Agent
 
 	// recorded classification calls
 	assignedKind    string
@@ -141,6 +159,22 @@ func (f *fakeClient) GetRunners() ([]api.Runner, error)          { return f.runn
 func (f *fakeClient) GetClusters() ([]api.ClusterSummary, error) { return f.clusters, f.err }
 func (f *fakeClient) GetConfigurations() ([]types.ConfigurationSummary, error) {
 	return f.configs, f.err
+}
+
+func (f *fakeClient) ExportConfiguration(projectName, format string) (*api.ConfigurationExport, error) {
+	return f.configExport, f.err
+}
+
+func (f *fakeClient) GetRepositories(provider string) ([]api.Repository, error) {
+	return f.repos, f.err
+}
+
+func (f *fakeClient) GetProviderStatus(provider string) (*api.ProviderStatus, error) {
+	return f.providerStat, f.err
+}
+
+func (f *fakeClient) VerifyProviderIdentity(provider, identityID string) (*api.ConnectIdentityResponse, error) {
+	return f.verifyResult, f.err
 }
 func (f *fakeClient) GetJobs(status string, limit, offset int) (*api.JobsPage, error) {
 	return f.jobsPage, f.err
@@ -332,6 +366,62 @@ func (f *fakeClient) AddComponent(project, kind, name string, fields map[string]
 func (f *fakeClient) RemoveComponent(project, kind, name string) error {
 	f.rmCompProj, f.rmCompKind, f.rmCompName = project, kind, name
 	return f.err
+}
+
+func (f *fakeClient) GetProjectDrift(project, env string) (*api.DriftPosture, error) {
+	return f.drift, f.err
+}
+
+func (f *fakeClient) GetEnvironmentCost(project, env string) (*api.EnvironmentCost, error) {
+	return f.cost, f.err
+}
+
+func (f *fakeClient) GetProjectProtection(project string) ([]api.ProtectionRule, error) {
+	return f.protection, f.err
+}
+
+func (f *fakeClient) GetProjectProbes(project string) ([]api.ProbeState, error) {
+	return f.probes, f.err
+}
+
+func (f *fakeClient) GetProjectAddons(project, env string) (*api.ProjectAddons, error) {
+	return f.addons, f.err
+}
+
+func (f *fakeClient) GetProjectByoCharts(project, env string) (*api.ProjectByoCharts, error) {
+	return f.byoCharts, f.err
+}
+
+func (f *fakeClient) GetProjectIacSource(project, env string) (*api.IacSource, error) {
+	return f.iacSource, f.err
+}
+
+func (f *fakeClient) GetProjectPromotions(project, env string) ([]api.Promotion, error) {
+	return f.promotions, f.err
+}
+
+func (f *fakeClient) GetPromotion(project, promotionID string) (*api.PromotionDetail, error) {
+	return f.promotion, f.err
+}
+
+func (f *fakeClient) GetProjectStagedChanges(project, env string) (*api.StagedChanges, error) {
+	return f.staged, f.err
+}
+
+func (f *fakeClient) GetCloudInventory(cloudIdentityID string) (*api.CloudInventory, error) {
+	return f.cloudInv, f.err
+}
+
+func (f *fakeClient) GetOrgSettings() (*api.OrgSettings, error) {
+	return f.orgSettings, f.err
+}
+
+func (f *fakeClient) ListAgents() ([]api.Agent, error) {
+	return f.agents, f.err
+}
+
+func (f *fakeClient) GetAgent(id string) (*api.Agent, error) {
+	return f.agent, f.err
 }
 
 var _ apiClient = (*fakeClient)(nil)

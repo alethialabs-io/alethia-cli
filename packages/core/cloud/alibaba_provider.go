@@ -233,7 +233,7 @@ func buildMNSTopics(topics []types.ProjectTopicConfig) map[string]interface{} {
 		subs := []map[string]string{}
 		for _, s := range t.Subscriptions {
 			subs = append(subs, map[string]string{
-				"protocol": s.Protocol,
+				"protocol": string(s.Protocol),
 				"endpoint": s.Endpoint,
 			})
 		}
@@ -248,7 +248,7 @@ func buildOTSTables(tables []types.ProjectNosqlConfig) []map[string]interface{} 
 		entry := map[string]interface{}{
 			"name":             t.Name,
 			"primary_key":      t.PartitionKey,
-			"primary_key_type": otsKeyType(t.PartitionKeyType),
+			"primary_key_type": otsKeyType(string(t.PartitionKeyType)),
 		}
 		result = append(result, entry)
 	}

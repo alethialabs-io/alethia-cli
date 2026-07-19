@@ -662,6 +662,78 @@ func TestGetProviderStatus_Success(t *testing.T) {
 	}
 }
 
+func TestVerifyProviderIdentity_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/providers/aws/verify" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Method != "POST" {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		var body struct {
+			IdentityID string `json:"identity_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("failed to decode body: %v", err)
+		}
+		if body.IdentityID != "id-123" {
+			t.Errorf("expected identity_id id-123, got %s", body.IdentityID)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"identity_id":         "id-123",
+			"verified":            true,
+			"status":              "connected",
+			"error":               nil,
+			"missing_permissions": []string{},
+		})
+	}))
+
+	resp, err := client.VerifyProviderIdentity("aws", "id-123")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !resp.Verified || resp.Status != "connected" {
+		t.Errorf("expected verified connected, got verified=%v status=%s", resp.Verified, resp.Status)
+	}
+}
+
+func TestVerifyProviderIdentity_ErrorPropagates(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]any{"error": "identity not found"})
+	}))
+
+	if _, err := client.VerifyProviderIdentity("aws", "missing"); err == nil {
+		t.Error("expected error to propagate")
+	}
+}
+
+func TestGetRepositories_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/repositories/github" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.Method != "GET" {
+			t.Errorf("expected GET, got %s", r.Method)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"repositories": []map[string]any{
+				{"id": "1", "name": "app", "full_name": "acme/app", "url": "u", "private": true, "default_branch": "main", "provider": "github"},
+			},
+		})
+	}))
+
+	repos, err := client.GetRepositories("github")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(repos) != 1 || repos[0].FullName != "acme/app" {
+		t.Errorf("unexpected repos: %+v", repos)
+	}
+}
+
 func TestConnectProviderIdentity_ErrorPropagates(t *testing.T) {
 	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -678,5 +750,378 @@ func TestConnectProviderIdentity_ErrorPropagates(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Invalid format") {
 		t.Errorf("expected error to contain the server message, got %q", err.Error())
+	}
+}
+
+func TestGetProjectDrift_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/projects/my-proj/drift" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("env") != "production" {
+			t.Errorf("expected env=production, got %q", r.URL.Query().Get("env"))
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"evaluated":   true,
+			"in_sync":     false,
+			"drifted":     1,
+			"scanned_at":  "2026-01-01T00:00:00.000Z",
+			"environment": "production",
+			"details":     []map[string]any{{"address": "aws_s3_bucket.x", "type": "aws_s3_bucket", "kind": "modified"}},
+		})
+	}))
+
+	posture, err := client.GetProjectDrift("my-proj", "production")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !posture.Evaluated || posture.Drifted != 1 || len(posture.Details) != 1 {
+		t.Errorf("unexpected posture: %+v", posture)
+	}
+	if posture.Details[0].Kind != "modified" {
+		t.Errorf("unexpected detail kind: %s", posture.Details[0].Kind)
+	}
+}
+
+func TestGetEnvironmentCost_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/projects/my-proj/cost" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"priced":        true,
+			"total_monthly": 42.5,
+			"currency":      "USD",
+			"captured_at":   "2026-01-01T00:00:00.000Z",
+			"plan_job_id":   "job-1",
+			"environment":   "staging",
+			"resources":     []map[string]any{{"address": "aws_db_instance.main", "resource_type": "aws_db_instance", "monthly_cost": 42.5}},
+		})
+	}))
+
+	cost, err := client.GetEnvironmentCost("my-proj", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cost.Priced || cost.TotalMonthly == nil || *cost.TotalMonthly != 42.5 {
+		t.Errorf("unexpected cost: %+v", cost)
+	}
+	if len(cost.Resources) != 1 || cost.Resources[0].ResourceType != "aws_db_instance" {
+		t.Errorf("unexpected resources: %+v", cost.Resources)
+	}
+}
+
+func TestGetProjectProtection_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/projects/my-proj/protection" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"rules": []map[string]any{{
+				"environment_id":       "env-1",
+				"environment":          "production",
+				"require_predecessor":  true,
+				"require_verify_pass":  true,
+				"require_approval":     true,
+				"min_count":            2,
+				"soak_minutes":         30,
+				"cost_delta_threshold": 100.0,
+			}},
+		})
+	}))
+
+	rules, err := client.GetProjectProtection("my-proj")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rules) != 1 || rules[0].Environment != "production" || !rules[0].RequireApproval {
+		t.Errorf("unexpected rules: %+v", rules)
+	}
+	if rules[0].MinCount == nil || *rules[0].MinCount != 2 {
+		t.Errorf("unexpected min_count: %+v", rules[0].MinCount)
+	}
+}
+
+func TestGetProjectProbes_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/projects/my-proj/probes" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"probes": []map[string]any{
+				{"environment_id": "env-1", "environment": "production", "reachable": true, "message": nil, "probed_at": "2026-01-01T00:00:00.000Z"},
+				{"environment_id": "env-2", "environment": "dev", "reachable": nil, "message": nil, "probed_at": nil},
+			},
+		})
+	}))
+
+	probes, err := client.GetProjectProbes("my-proj")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(probes) != 2 {
+		t.Fatalf("expected 2 probes, got %d", len(probes))
+	}
+	if probes[0].Reachable == nil || !*probes[0].Reachable {
+		t.Errorf("expected production reachable=true, got %+v", probes[0].Reachable)
+	}
+	if probes[1].Reachable != nil {
+		t.Errorf("expected dev reachable=nil (never probed), got %+v", probes[1].Reachable)
+	}
+}
+
+func TestGetProjectAddons_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/projects/my-proj/addons" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"environment": "production",
+			"addons": []map[string]any{
+				{"addon_id": "cnpg", "enabled": true, "mode": "managed", "version": nil, "namespace": "cnpg", "status": "READY", "health": "Healthy", "sync": "Synced", "last_synced_at": nil},
+			},
+		})
+	}))
+
+	view, err := client.GetProjectAddons("my-proj", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if view.Environment != "production" || len(view.Addons) != 1 || view.Addons[0].AddonID != "cnpg" {
+		t.Errorf("unexpected view: %+v", view)
+	}
+}
+
+func TestGetProjectByoCharts_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/projects/my-proj/byo-charts" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"environment": "production",
+			"charts": []map[string]any{
+				{"id": "payments", "repo_url": "u", "chart_path": "charts/payments", "ref": "main", "namespace": "payments", "status": "READY", "health": nil, "sync": nil, "scan_status": "done", "scanned_at": nil},
+			},
+		})
+	}))
+
+	view, err := client.GetProjectByoCharts("my-proj", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(view.Charts) != 1 || view.Charts[0].ID != "payments" {
+		t.Errorf("unexpected charts: %+v", view.Charts)
+	}
+}
+
+func TestGetProjectIacSource_Present(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/projects/my-proj/byo-iac" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"source": map[string]any{
+				"id": "src-1", "environment": "production", "name": "networking", "repo_url": "u",
+				"ref": nil, "path": "envs/prod", "commit_sha": nil, "deployed_commit_sha": nil,
+				"enabled": true, "scan_status": "done", "scanned_at": nil, "status": "READY", "status_message": nil,
+			},
+		})
+	}))
+
+	src, err := client.GetProjectIacSource("my-proj", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if src == nil || src.Name != "networking" {
+		t.Errorf("unexpected source: %+v", src)
+	}
+}
+
+func TestGetProjectIacSource_None(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"source": nil})
+	}))
+
+	src, err := client.GetProjectIacSource("my-proj", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if src != nil {
+		t.Errorf("expected nil source, got %+v", src)
+	}
+}
+
+func TestGetProjectPromotions_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/projects/my-proj/promotions" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"promotions": []map[string]any{
+				{"id": "p1", "source": "staging", "target": "production", "status": "DEPLOYED", "error_message": nil, "created_at": "2026-01-01T00:00:00.000Z", "completed_at": nil},
+			},
+		})
+	}))
+
+	promos, err := client.GetProjectPromotions("my-proj", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(promos) != 1 || promos[0].Target != "production" {
+		t.Errorf("unexpected promotions: %+v", promos)
+	}
+}
+
+func TestGetPromotion_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/projects/my-proj/promotions/p1" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"promotion": map[string]any{
+				"id": "p1", "source": "staging", "target": "production", "status": "PENDING_APPROVAL",
+				"initiator": "Ivo", "error_message": nil, "approved": 1, "required": 2,
+				"approvals": []map[string]any{
+					{"id": "a1", "status": "approved", "name": "Ivo", "required_role": "admin", "comment": nil, "decided_at": "2026-01-01T01:00:00.000Z"},
+				},
+				"created_at": "2026-01-01T00:00:00.000Z", "completed_at": nil,
+			},
+		})
+	}))
+
+	p, err := client.GetPromotion("my-proj", "p1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.Approved != 1 || p.Required != 2 || len(p.Approvals) != 1 {
+		t.Errorf("unexpected promotion detail: %+v", p)
+	}
+}
+
+func TestGetProjectStagedChanges_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/projects/my-proj/staged" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"environment": "production",
+			"changes": []map[string]any{
+				{"component_type": "database", "op": "create", "component_id": nil, "created_at": "2026-01-01T00:00:00.000Z"},
+			},
+		})
+	}))
+
+	view, err := client.GetProjectStagedChanges("my-proj", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if view.Environment != "production" || len(view.Changes) != 1 || view.Changes[0].Op != "create" {
+		t.Errorf("unexpected staged changes: %+v", view)
+	}
+}
+
+func TestGetCloudInventory_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/cloud-identities/id-1/inventory" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"networks": []map[string]any{{"native_id": "vpc-1", "name": "main", "region": "eu-west-1", "provider": "aws", "cidr_block": "10.0.0.0/16", "is_default": true}},
+			"subnets":  []map[string]any{{"native_id": "subnet-1", "name": nil, "region": "eu-west-1", "availability_zone": "eu-west-1a", "cidr_block": "10.0.1.0/24", "is_public": true}},
+			"regions":  []string{"eu-west-1"},
+		})
+	}))
+
+	inv, err := client.GetCloudInventory("id-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(inv.Networks) != 1 || inv.Networks[0].NativeID != "vpc-1" || len(inv.Subnets) != 1 || len(inv.Regions) != 1 {
+		t.Errorf("unexpected inventory: %+v", inv)
+	}
+}
+
+func TestGetOrgSettings_Present(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/org-settings" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"settings": map[string]any{"name": "Acme", "slug": "acme", "description": "", "logo": nil, "region": "eu-west-1", "default_env": "staging", "terraform_version": "1.9.5"},
+		})
+	}))
+
+	s, err := client.GetOrgSettings()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s == nil || s.Name != "Acme" {
+		t.Errorf("unexpected settings: %+v", s)
+	}
+}
+
+func TestGetOrgSettings_Community(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"settings": nil})
+	}))
+
+	s, err := client.GetOrgSettings()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if s != nil {
+		t.Errorf("expected nil settings in community mode, got %+v", s)
+	}
+}
+
+func TestListAgents_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/agents" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"agents": []map[string]any{{"id": "ag-1", "persona": "provisioner", "mission": "m", "tool_scope": []string{"plan"}, "memory_namespace": "ns", "project_id": nil, "version": 1, "created_at": "2026-01-01T00:00:00.000Z", "updated_at": "2026-01-01T00:00:00.000Z"}},
+		})
+	}))
+
+	agents, err := client.ListAgents()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(agents) != 1 || agents[0].Persona != "provisioner" {
+		t.Errorf("unexpected agents: %+v", agents)
+	}
+}
+
+func TestGetAgent_Success(t *testing.T) {
+	client := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertAuth(t, r)
+		if r.URL.Path != "/api/cli/agents/ag-1" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"agent": map[string]any{"id": "ag-1", "persona": "provisioner", "mission": "m", "tool_scope": []string{"plan", "apply"}, "memory_namespace": "ns", "project_id": nil, "version": 2, "created_at": "2026-01-01T00:00:00.000Z", "updated_at": "2026-01-01T00:00:00.000Z"},
+		})
+	}))
+
+	a, err := client.GetAgent("ag-1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if a.Version != 2 || len(a.ToolScope) != 2 {
+		t.Errorf("unexpected agent: %+v", a)
 	}
 }

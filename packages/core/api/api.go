@@ -61,6 +61,7 @@ type ProvisionJob struct {
 	UserID            string                  `json:"user_id"`
 	OrgID             string                  `json:"org_id"`
 	JobType           string                  `json:"job_type"`
+	InitiatedBy       string                  `json:"initiated_by"`
 	ProjectID         string                  `json:"project_id"`
 	CloudIdentityID   string                  `json:"cloud_identity_id"`
 	RunnerID          string                  `json:"runner_id"`
@@ -130,6 +131,28 @@ type ClusterSummary struct {
 	Region               string   `json:"region"`
 }
 
+// ClusterGitops is the compact ArgoCD/GitOps posture for a cluster's default environment,
+// derived from the console Deploy-tab read model. Mirrors clusterGitops in cli-contract.ts.
+type ClusterGitops struct {
+	Mode             string  `json:"mode"`
+	AppsRepo         *string `json:"apps_repo"`
+	Revision         *string `json:"revision"`
+	Total            int     `json:"total"`
+	Synced           int     `json:"synced"`
+	Healthy          int     `json:"healthy"`
+	StatusAvailable  bool    `json:"status_available"`
+	LastDeployFailed bool    `json:"last_deploy_failed"`
+	FailedStep       *string `json:"failed_step"`
+	FailureMessage   *string `json:"failure_message"`
+}
+
+// ClusterDetail is a single cluster plus its GitOps posture (GET /api/cli/clusters/:id).
+// Mirrors cliClusterDetailResponse in cli-contract.ts.
+type ClusterDetail struct {
+	Cluster ClusterSummary `json:"cluster"`
+	Gitops  *ClusterGitops `json:"gitops"`
+}
+
 type CloudIdentity struct {
 	ID        string `json:"id"`
 	Provider  string `json:"provider"`
@@ -155,7 +178,11 @@ type QueueJobParams struct {
 	CloudIdentityID  string
 	AssignedRunnerID string
 	PlanJobID        string
-	ConfigSnapshot   map[string]interface{}
+	// EnvironmentID targets a specific environment of the project (the decoupled env-model,
+	// #843). Empty → the server resolves the project's default environment (back-compat). The
+	// server (#837) routes it through planProject/provisionProject/destroyProject.
+	EnvironmentID  string
+	ConfigSnapshot map[string]interface{}
 }
 
 // --- Helpers ---
@@ -406,6 +433,9 @@ func (c *Client) QueueJobWithParams(params QueueJobParams) (*ProvisionJob, error
 	if params.PlanJobID != "" {
 		payload["plan_job_id"] = params.PlanJobID
 	}
+	if params.EnvironmentID != "" {
+		payload["environment_id"] = params.EnvironmentID
+	}
 	if params.ConfigSnapshot != nil {
 		payload["config_snapshot"] = params.ConfigSnapshot
 	}
@@ -521,6 +551,16 @@ func (c *Client) GetClusters() ([]ClusterSummary, error) {
 		return nil, fmt.Errorf("failed to get clusters: %w", err)
 	}
 	return successResp.Clusters, nil
+}
+
+// GetCluster fetches a single cluster by its id, plus its compact ArgoCD/GitOps posture.
+func (c *Client) GetCluster(id string) (*ClusterDetail, error) {
+	endpoint := fmt.Sprintf("%s/cli/clusters/%s", c.baseURL, id)
+	var detail ClusterDetail
+	if err := c.doGet(endpoint, &detail); err != nil {
+		return nil, fmt.Errorf("failed to get cluster: %w", err)
+	}
+	return &detail, nil
 }
 
 // --- Legacy (used by core/utils) ---
@@ -725,6 +765,20 @@ func (c *Client) GetProviderStatus(provider string) (*ProviderStatus, error) {
 	var resp ProviderStatus
 	if err := c.doGet(endpoint, &resp); err != nil {
 		return nil, fmt.Errorf("failed to get %s status: %w", provider, err)
+	}
+	return &resp, nil
+}
+
+// VerifyProviderIdentity re-runs the server-side health probe against a saved
+// cloud identity (auth + provisioning-capability check) and returns the verdict.
+// The server verifies INLINE — there is no job to poll. The identityID is the
+// connected identity (see GetProviderStatus.IdentityID).
+func (c *Client) VerifyProviderIdentity(provider, identityID string) (*ConnectIdentityResponse, error) {
+	endpoint := fmt.Sprintf("%s/cli/providers/%s/verify", c.baseURL, provider)
+	payload := map[string]interface{}{"identity_id": identityID}
+	var resp ConnectIdentityResponse
+	if err := c.doPost(endpoint, payload, &resp); err != nil {
+		return nil, fmt.Errorf("failed to verify %s connection: %w", provider, err)
 	}
 	return &resp, nil
 }
@@ -1570,6 +1624,435 @@ func (c *Client) RemoveComponent(project, kind, name string) error {
 		return fmt.Errorf("failed to remove component: %w", err)
 	}
 	return nil
+}
+
+// --- Drift ---
+
+// DriftDetail is a single drifted resource in a DriftPosture (mirrors the console DriftDetail).
+type DriftDetail struct {
+	Address string `json:"address"`
+	Type    string `json:"type"`
+	Kind    string `json:"kind"`
+}
+
+// DriftPosture is the latest day-2 drift posture of a project environment
+// (GET /api/cli/projects/:id/drift). Evaluated is false when no DETECT_DRIFT job has run yet —
+// an honest "not proven" rather than a false in-sync.
+type DriftPosture struct {
+	Evaluated   bool          `json:"evaluated"`
+	InSync      bool          `json:"in_sync"`
+	Drifted     int           `json:"drifted"`
+	ScannedAt   *string       `json:"scanned_at"`
+	Environment *string       `json:"environment"`
+	Details     []DriftDetail `json:"details"`
+}
+
+// GetProjectDrift returns the latest drift posture for a project, optionally scoped to one
+// environment (by name, stage, or id).
+func (c *Client) GetProjectDrift(project, env string) (*DriftPosture, error) {
+	endpoint := fmt.Sprintf("%s/cli/projects/%s/drift", c.baseURL, url.PathEscape(project))
+	if env != "" {
+		endpoint = fmt.Sprintf("%s?env=%s", endpoint, url.QueryEscape(env))
+	}
+	var resp DriftPosture
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get drift: %w", err)
+	}
+	return &resp, nil
+}
+
+// --- Cost ---
+
+// CostResourceLine is one priced resource in an EnvironmentCost (mirrors CostResourceLine).
+type CostResourceLine struct {
+	Address      string  `json:"address"`
+	ResourceType string  `json:"resource_type"`
+	MonthlyCost  float64 `json:"monthly_cost"`
+}
+
+// EnvironmentCost is the latest priced picture of a project environment
+// (GET /api/cli/projects/:id/cost). Priced is false when no plan has ever priced it.
+type EnvironmentCost struct {
+	Priced       bool               `json:"priced"`
+	TotalMonthly *float64           `json:"total_monthly"`
+	Currency     string             `json:"currency"`
+	CapturedAt   *string            `json:"captured_at"`
+	PlanJobID    *string            `json:"plan_job_id"`
+	Environment  *string            `json:"environment"`
+	Resources    []CostResourceLine `json:"resources"`
+}
+
+// GetEnvironmentCost returns the latest cost for a project environment (the default environment
+// when env is empty; otherwise the environment addressed by name, stage, or id).
+func (c *Client) GetEnvironmentCost(project, env string) (*EnvironmentCost, error) {
+	endpoint := fmt.Sprintf("%s/cli/projects/%s/cost", c.baseURL, url.PathEscape(project))
+	if env != "" {
+		endpoint = fmt.Sprintf("%s?env=%s", endpoint, url.QueryEscape(env))
+	}
+	var resp EnvironmentCost
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get cost: %w", err)
+	}
+	return &resp, nil
+}
+
+// --- Protection ---
+
+// ProtectionRule is one environment's promotion protection gates (mirrors ProtectionSummary).
+type ProtectionRule struct {
+	EnvironmentID      string   `json:"environment_id"`
+	Environment        string   `json:"environment"`
+	RequirePredecessor bool     `json:"require_predecessor"`
+	RequireVerifyPass  bool     `json:"require_verify_pass"`
+	RequireApproval    bool     `json:"require_approval"`
+	MinCount           *int     `json:"min_count"`
+	SoakMinutes        *int     `json:"soak_minutes"`
+	CostDeltaThreshold *float64 `json:"cost_delta_threshold"`
+}
+
+// GetProjectProtection returns each environment's promotion protection rules for a project.
+func (c *Client) GetProjectProtection(project string) ([]ProtectionRule, error) {
+	endpoint := fmt.Sprintf("%s/cli/projects/%s/protection", c.baseURL, url.PathEscape(project))
+	var resp struct {
+		Rules []ProtectionRule `json:"rules"`
+	}
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get protection rules: %w", err)
+	}
+	return resp.Rules, nil
+}
+
+// --- Probes ---
+
+// ProbeState is one environment's latest cluster-alive probe (mirrors the console ProbeState).
+// Reachable is nil when the environment has never been probed.
+type ProbeState struct {
+	EnvironmentID string  `json:"environment_id"`
+	Environment   string  `json:"environment"`
+	Reachable     *bool   `json:"reachable"`
+	Message       *string `json:"message"`
+	ProbedAt      *string `json:"probed_at"`
+}
+
+// GetProjectProbes returns each environment's latest cluster-alive probe state for a project.
+func (c *Client) GetProjectProbes(project string) ([]ProbeState, error) {
+	endpoint := fmt.Sprintf("%s/cli/projects/%s/probes", c.baseURL, url.PathEscape(project))
+	var resp struct {
+		Probes []ProbeState `json:"probes"`
+	}
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get probes: %w", err)
+	}
+	return resp.Probes, nil
+}
+
+// --- Add-ons ---
+
+// Addon is one installed catalog add-on in an environment.
+type Addon struct {
+	AddonID      string  `json:"addon_id"`
+	Enabled      bool    `json:"enabled"`
+	Mode         string  `json:"mode"`
+	Version      *string `json:"version"`
+	Namespace    *string `json:"namespace"`
+	Status       string  `json:"status"`
+	Health       *string `json:"health"`
+	Sync         *string `json:"sync"`
+	LastSyncedAt *string `json:"last_synced_at"`
+}
+
+// ProjectAddons is the installed catalog add-ons for one environment.
+type ProjectAddons struct {
+	Environment string  `json:"environment"`
+	Addons      []Addon `json:"addons"`
+}
+
+// GetProjectAddons returns the catalog add-ons installed in a project environment (the default
+// environment when env is empty; otherwise the environment addressed by name, stage, or id).
+func (c *Client) GetProjectAddons(project, env string) (*ProjectAddons, error) {
+	endpoint := fmt.Sprintf("%s/cli/projects/%s/addons", c.baseURL, url.PathEscape(project))
+	if env != "" {
+		endpoint = fmt.Sprintf("%s?env=%s", endpoint, url.QueryEscape(env))
+	}
+	var resp ProjectAddons
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get add-ons: %w", err)
+	}
+	return &resp, nil
+}
+
+// --- BYO charts ---
+
+// ByoChart is one attached BYO Helm chart in an environment (scan status only, not the report).
+type ByoChart struct {
+	ID         string  `json:"id"`
+	RepoURL    string  `json:"repo_url"`
+	ChartPath  string  `json:"chart_path"`
+	Ref        string  `json:"ref"`
+	Namespace  string  `json:"namespace"`
+	Status     string  `json:"status"`
+	Health     *string `json:"health"`
+	Sync       *string `json:"sync"`
+	ScanStatus string  `json:"scan_status"`
+	ScannedAt  *string `json:"scanned_at"`
+}
+
+// ProjectByoCharts is the BYO Helm charts attached to one environment.
+type ProjectByoCharts struct {
+	Environment string     `json:"environment"`
+	Charts      []ByoChart `json:"charts"`
+}
+
+// GetProjectByoCharts returns the BYO Helm charts attached to a project environment.
+func (c *Client) GetProjectByoCharts(project, env string) (*ProjectByoCharts, error) {
+	endpoint := fmt.Sprintf("%s/cli/projects/%s/byo-charts", c.baseURL, url.PathEscape(project))
+	if env != "" {
+		endpoint = fmt.Sprintf("%s?env=%s", endpoint, url.QueryEscape(env))
+	}
+	var resp ProjectByoCharts
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get BYO charts: %w", err)
+	}
+	return &resp, nil
+}
+
+// --- BYO IaC ---
+
+// IacSource is the customer's BYO Terraform/OpenTofu source attached to an environment (scan
+// status only, not the report).
+type IacSource struct {
+	ID                string  `json:"id"`
+	Environment       string  `json:"environment"`
+	Name              string  `json:"name"`
+	RepoURL           string  `json:"repo_url"`
+	Ref               *string `json:"ref"`
+	Path              string  `json:"path"`
+	CommitSha         *string `json:"commit_sha"`
+	DeployedCommitSha *string `json:"deployed_commit_sha"`
+	Enabled           bool    `json:"enabled"`
+	ScanStatus        string  `json:"scan_status"`
+	ScannedAt         *string `json:"scanned_at"`
+	Status            string  `json:"status"`
+	StatusMessage     *string `json:"status_message"`
+}
+
+// GetProjectIacSource returns the BYO IaC source attached to a project environment, or nil when
+// none is attached.
+func (c *Client) GetProjectIacSource(project, env string) (*IacSource, error) {
+	endpoint := fmt.Sprintf("%s/cli/projects/%s/byo-iac", c.baseURL, url.PathEscape(project))
+	if env != "" {
+		endpoint = fmt.Sprintf("%s?env=%s", endpoint, url.QueryEscape(env))
+	}
+	var resp struct {
+		Source *IacSource `json:"source"`
+	}
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get IaC source: %w", err)
+	}
+	return resp.Source, nil
+}
+
+// --- Promotions ---
+
+// Promotion is one environment promotion (source → target), as listed.
+type Promotion struct {
+	ID           string  `json:"id"`
+	Source       string  `json:"source"`
+	Target       string  `json:"target"`
+	Status       string  `json:"status"`
+	ErrorMessage *string `json:"error_message"`
+	CreatedAt    string  `json:"created_at"`
+	CompletedAt  *string `json:"completed_at"`
+}
+
+// GetProjectPromotions returns a project's promotions, optionally scoped to one target
+// environment (by name, stage, or id).
+func (c *Client) GetProjectPromotions(project, env string) ([]Promotion, error) {
+	endpoint := fmt.Sprintf("%s/cli/projects/%s/promotions", c.baseURL, url.PathEscape(project))
+	if env != "" {
+		endpoint = fmt.Sprintf("%s?env=%s", endpoint, url.QueryEscape(env))
+	}
+	var resp struct {
+		Promotions []Promotion `json:"promotions"`
+	}
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get promotions: %w", err)
+	}
+	return resp.Promotions, nil
+}
+
+// PromotionApproval is one approval slot on a promotion.
+type PromotionApproval struct {
+	ID           string  `json:"id"`
+	Status       string  `json:"status"`
+	Name         *string `json:"name"`
+	RequiredRole *string `json:"required_role"`
+	Comment      *string `json:"comment"`
+	DecidedAt    *string `json:"decided_at"`
+}
+
+// PromotionDetail is a promotion with its approval slots (gate detail + config diff are
+// console-only).
+type PromotionDetail struct {
+	ID           string              `json:"id"`
+	Source       string              `json:"source"`
+	Target       string              `json:"target"`
+	Status       string              `json:"status"`
+	Initiator    *string             `json:"initiator"`
+	ErrorMessage *string             `json:"error_message"`
+	Approved     int                 `json:"approved"`
+	Required     int                 `json:"required"`
+	Approvals    []PromotionApproval `json:"approvals"`
+	CreatedAt    string              `json:"created_at"`
+	CompletedAt  *string             `json:"completed_at"`
+}
+
+// GetPromotion returns one promotion (scoped to the project) with its approval slots.
+func (c *Client) GetPromotion(project, promotionID string) (*PromotionDetail, error) {
+	endpoint := fmt.Sprintf(
+		"%s/cli/projects/%s/promotions/%s",
+		c.baseURL, url.PathEscape(project), url.PathEscape(promotionID),
+	)
+	var resp struct {
+		Promotion PromotionDetail `json:"promotion"`
+	}
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get promotion: %w", err)
+	}
+	return &resp.Promotion, nil
+}
+
+// --- Staged changes ---
+
+// StagedChange is one pending canvas change on an environment.
+type StagedChange struct {
+	ComponentType string  `json:"component_type"`
+	Op            string  `json:"op"`
+	ComponentID   *string `json:"component_id"`
+	CreatedAt     string  `json:"created_at"`
+}
+
+// StagedChanges is an environment's durable staged (pending) canvas changes.
+type StagedChanges struct {
+	Environment string         `json:"environment"`
+	Changes     []StagedChange `json:"changes"`
+}
+
+// GetProjectStagedChanges returns an environment's staged changes (the default environment when
+// env is empty; otherwise the environment addressed by name, stage, or id).
+func (c *Client) GetProjectStagedChanges(project, env string) (*StagedChanges, error) {
+	endpoint := fmt.Sprintf("%s/cli/projects/%s/staged", c.baseURL, url.PathEscape(project))
+	if env != "" {
+		endpoint = fmt.Sprintf("%s?env=%s", endpoint, url.QueryEscape(env))
+	}
+	var resp StagedChanges
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get staged changes: %w", err)
+	}
+	return &resp, nil
+}
+
+// --- Cloud inventory ---
+
+// CloudNetwork is one discovered network in a cloud identity's inventory.
+type CloudNetwork struct {
+	NativeID  string  `json:"native_id"`
+	Name      *string `json:"name"`
+	Region    *string `json:"region"`
+	Provider  string  `json:"provider"`
+	CidrBlock *string `json:"cidr_block"`
+	IsDefault bool    `json:"is_default"`
+}
+
+// CloudSubnet is one discovered subnet in a cloud identity's inventory.
+type CloudSubnet struct {
+	NativeID         string  `json:"native_id"`
+	Name             *string `json:"name"`
+	Region           *string `json:"region"`
+	AvailabilityZone *string `json:"availability_zone"`
+	CidrBlock        *string `json:"cidr_block"`
+	IsPublic         bool    `json:"is_public"`
+}
+
+// CloudInventory is the discovered networking + regions for a cloud identity.
+type CloudInventory struct {
+	Networks []CloudNetwork `json:"networks"`
+	Subnets  []CloudSubnet  `json:"subnets"`
+	Regions  []string       `json:"regions"`
+}
+
+// GetCloudInventory returns the discovered networking inventory for a connected cloud identity.
+func (c *Client) GetCloudInventory(cloudIdentityID string) (*CloudInventory, error) {
+	endpoint := fmt.Sprintf("%s/cli/cloud-identities/%s/inventory", c.baseURL, url.PathEscape(cloudIdentityID))
+	var resp CloudInventory
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get cloud inventory: %w", err)
+	}
+	return &resp, nil
+}
+
+// --- Org settings ---
+
+// OrgSettings is the active organization's general settings.
+type OrgSettings struct {
+	Name             string  `json:"name"`
+	Slug             string  `json:"slug"`
+	Description      string  `json:"description"`
+	Logo             *string `json:"logo"`
+	Region           string  `json:"region"`
+	DefaultEnv       string  `json:"default_env"`
+	TerraformVersion string  `json:"terraform_version"`
+}
+
+// GetOrgSettings returns the active org's general settings, or nil in community (personal) mode.
+func (c *Client) GetOrgSettings() (*OrgSettings, error) {
+	endpoint := fmt.Sprintf("%s/cli/org-settings", c.baseURL)
+	var resp struct {
+		Settings *OrgSettings `json:"settings"`
+	}
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get org settings: %w", err)
+	}
+	return resp.Settings, nil
+}
+
+// --- Agents ---
+
+// Agent is a machine/agent identity (persona) the caller owns.
+type Agent struct {
+	ID              string   `json:"id"`
+	Persona         string   `json:"persona"`
+	Mission         string   `json:"mission"`
+	ToolScope       []string `json:"tool_scope"`
+	MemoryNamespace string   `json:"memory_namespace"`
+	ProjectID       *string  `json:"project_id"`
+	Version         int      `json:"version"`
+	CreatedAt       string   `json:"created_at"`
+	UpdatedAt       string   `json:"updated_at"`
+}
+
+// ListAgents returns the caller's agent identities.
+func (c *Client) ListAgents() ([]Agent, error) {
+	endpoint := fmt.Sprintf("%s/cli/agents", c.baseURL)
+	var resp struct {
+		Agents []Agent `json:"agents"`
+	}
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to list agents: %w", err)
+	}
+	return resp.Agents, nil
+}
+
+// GetAgent returns one agent identity by id, scoped to the caller's tenancy.
+func (c *Client) GetAgent(id string) (*Agent, error) {
+	endpoint := fmt.Sprintf("%s/cli/agents/%s", c.baseURL, url.PathEscape(id))
+	var resp struct {
+		Agent Agent `json:"agent"`
+	}
+	if err := c.doGet(endpoint, &resp); err != nil {
+		return nil, fmt.Errorf("failed to get agent: %w", err)
+	}
+	return &resp.Agent, nil
 }
 
 // --- Break-glass (privileged incident recovery) ---
